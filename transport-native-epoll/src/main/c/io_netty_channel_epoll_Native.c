@@ -84,6 +84,8 @@ jmethodID closedChannelExceptionMethodId = NULL;
 jclass inetSocketAddressClass = NULL;
 jclass datagramSocketAddressClass = NULL;
 jclass nativeDatagramPacketClass = NULL;
+jclass systemClass = NULL;
+jmethodID systemClassGetPropertyMethodId = NULL;
 
 static int socketType;
 static const char* ip4prefix = "::ffff:";
@@ -305,7 +307,24 @@ static int init_sockaddr(JNIEnv* env, jbyteArray address, jint scopeId, jint jpo
     return 0;
 }
 
-static int socket_type() {
+
+static int getSystemPropertyBoolean(JNIEnv* env, const char* name) {
+    jstring propertyNameString = (*env)->NewStringUTF(env, name);
+    jstring propertyString = (*env)->CallStaticObjectMethod(env, systemClass, systemClassGetPropertyMethodId, propertyNameString);
+    if (propertyString == NULL) {
+        return JNI_FALSE;
+    }
+    const char* property = (*env)->GetStringUTFChars(env, propertyString, 0);
+    int result = strcmp(property, "true" );
+    (*env)->ReleaseStringUTFChars(env, propertyString, property);
+    return result;
+}
+
+static int socket_type(JNIEnv* env) {
+    if (getSystemPropertyBoolean(env, "java.net.preferIPv4Stack") == 0) {
+        // User asked to use ipv4 explicitly.
+        return AF_INET;
+    }
     int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd == -1) {
         if (errno == EAFNOSUPPORT) {
@@ -343,6 +362,24 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     if ((*vm)->GetEnv(vm, (void**) &env, JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     } else {
+        jclass localSystemClass = (*env)->FindClass(env, "java/lang/System" );
+        if (localSystemClass == NULL) {
+            // pending exception...
+            return JNI_ERR;
+        }
+        systemClass = (jclass) (*env)->NewGlobalRef(env, localSystemClass);
+        if (systemClass == NULL) {
+            // out-of-memory!
+            throwOutOfMemoryError(env);
+            return JNI_ERR;
+        }
+
+        systemClassGetPropertyMethodId = (*env)->GetStaticMethodID(env, systemClass, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;" );
+        if (systemClassGetPropertyMethodId == NULL) {
+            // position method was not found.. something is wrong so bail out
+            throwRuntimeException(env, "failed to get method ID: System.getProperty(String)");
+            return JNI_ERR;
+        }
         // cache classes that are used within other jni methods for performance reasons
         jclass localClosedChannelExceptionClass = (*env)->FindClass(env, "java/nio/channels/ClosedChannelException");
         if (localClosedChannelExceptionClass == NULL) {
@@ -509,7 +546,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
             throwRuntimeException(env, "failed to get method ID: InetSocketAddress.<init>(String, int)");
             return JNI_ERR;
         }
-        socketType = socket_type();
+        socketType = socket_type(env);
 
         datagramSocketAddrMethodId = (*env)->GetMethodID(env, datagramSocketAddressClass, "<init>", "(Ljava/lang/String;II)V");
         if (datagramSocketAddrMethodId == NULL) {
@@ -574,6 +611,9 @@ void JNI_OnUnload(JavaVM* vm, void* reserved) {
         }
         if (datagramSocketAddressClass != NULL) {
             (*env)->DeleteGlobalRef(env, datagramSocketAddressClass);
+        }
+        if (systemClass != NULL) {
+            (*env)->DeleteGlobalRef(env, systemClass);
         }
     }
 }
@@ -952,7 +992,6 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_shutdown0(JNIEnv* env,
 }
 
 static inline jint socket0(JNIEnv* env, jclass clazz, int type) {
-    // TODO: Maybe also respect -Djava.net.preferIPv4Stack=true
     int fd = socket(socketType, type | SOCK_NONBLOCK, 0);
     if (fd == -1) {
         return -errno;
